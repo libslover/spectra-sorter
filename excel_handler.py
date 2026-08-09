@@ -4,14 +4,13 @@
 """
 
 import os
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional, Tuple, Union
 
+import portalocker
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
 
 
 class CellValidationError(Exception):
@@ -26,104 +25,57 @@ class RowValidationError(Exception):
 
 class ExcelFileLock:
     """
-    Класс для блокировки Excel файла на уровне ОС.
-    Создает .lock файл с информацией о процессе, который удерживает файл.
-    Также пытается захватить эксклюзивную блокировку черезfcntl/msvcrt.
+    Класс для блокировки Excel файла на уровне ОС с использованием portalocker.
+    Удерживает блокировку .lock файла, предотвращая доступ другим процессам.
     """
     
     def __init__(self, file_path: str):
         self.file_path = Path(file_path).resolve()
         self.lock_file_path = self.file_path.with_suffix(self.file_path.suffix + '.lock')
-        self.lock_info = {
-            'pid': os.getpid(),
-            'user': os.environ.get('USER', 'unknown'),
-            'timestamp': datetime.now().isoformat()
-        }
         self._locked = False
-        self._lock_handle = None  # Дескриптор lock-файла для удержания блокировки
+        self._lock_file_handle = None
     
     def acquire(self) -> bool:
         """
-        Попытка захватить блокировку файла.
-        Создает .lock файл и удерживает его открытым.
+        Попытка захватить блокировку файла через portalocker.
         Возвращает True если блокировка успешна, False если файл уже заблокирован.
         """
-        # Проверяем наличие lock-файла
-        if self.lock_file_path.exists():
-            # Проверяем, не stale ли lock файл
-            try:
-                with open(self.lock_file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                # Если процесс больше не существует, можно удалить lock
-                try:
-                    import psutil
-                    locked_pid = int(content.split('\n')[0].split(':')[1].strip())
-                    if not psutil.pid_exists(locked_pid):
-                        self.lock_file_path.unlink()
-                    else:
-                        return False
-                except ImportError:
-                    # Если psutil не установлен, просто считаем файл заблокированным
-                    return False
-            except (FileNotFoundError, ValueError, IndexError):
-                pass
-        
         try:
-            # Создаем/открываем lock-файл и удерживаем его открытым
-            # Это предотвращает удаление файла пока мы его держим
-            self._lock_handle = open(self.lock_file_path, 'w', encoding='utf-8')
-            self._lock_handle.write(f"PID: {self.lock_info['pid']}\n")
-            self._lock_handle.write(f"User: {self.lock_info['user']}\n")
-            self._lock_handle.write(f"Timestamp: {self.lock_info['timestamp']}\n")
-            self._lock_handle.flush()
+            # Открываем .lock файл и блокируем его эксклюзивно
+            self._lock_file_handle = open(self.lock_file_path, 'w')
+            portalocker.lock(self._lock_file_handle, portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING)
             
-            # Пытаемся захватить блокировку на lock-файле
-            if os.name == 'nt':
-                try:
-                    import msvcrt
-                    # Блокируем lock-файл
-                    msvcrt.locking(self._lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
-                except (ImportError, OSError):
-                    pass
-            else:
-                try:
-                    import fcntl
-                    fcntl.flock(self._lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except (ImportError, BlockingIOError):
-                    pass
+            # Записываем информацию о блокировке
+            lock_info = {
+                'pid': os.getpid(),
+                'timestamp': datetime.now().isoformat()
+            }
+            self._lock_file_handle.write(f"PID: {lock_info['pid']}\nTimestamp: {lock_info['timestamp']}\n")
+            self._lock_file_handle.flush()
             
             self._locked = True
             return True
             
-        except PermissionError:
-            # Файл уже заблокирован другим процессом
+        except (portalocker.AlreadyLocked, PermissionError, IOError):
+            if self._lock_file_handle:
+                self._lock_file_handle.close()
+                self._lock_file_handle = None
             return False
         except Exception:
-            if self._lock_handle:
-                self._lock_handle.close()
-                self._lock_handle = None
+            if self._lock_file_handle:
+                self._lock_file_handle.close()
+                self._lock_file_handle = None
             return False
     
     def release(self):
         """Освободить блокировку файла."""
-        if self._lock_handle:
+        if self._lock_file_handle:
             try:
-                if os.name == 'nt':
-                    try:
-                        import msvcrt
-                        msvcrt.locking(self._lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
-                    except:
-                        pass
-                else:
-                    try:
-                        import fcntl
-                        fcntl.flock(self._lock_handle.fileno(), fcntl.LOCK_UN)
-                    except:
-                        pass
-                self._lock_handle.close()
+                portalocker.unlock(self._lock_file_handle)
+                self._lock_file_handle.close()
             except Exception:
                 pass
-            self._lock_handle = None
+            self._lock_file_handle = None
         
         # Удаляем lock-файл
         if self._locked and self.lock_file_path.exists():
@@ -440,37 +392,23 @@ class ExcelWorkbook:
         Raises:
             FileNotFoundError: Файл не найден и create_new=False
             FileExistsError: Файл заблокирован другим процессом
-            ValueError: Некорректный файл Excel
         """
         self._file_path = Path(file_path).resolve()
         
-        # Если файл не существует и не создаем новый - ошибка
-        if not self._file_path.exists():
-            if not create_new:
-                raise FileNotFoundError(f"Файл {self._file_path} не найден")
-            # Создаем новую книгу и сохраняем
+        if create_new or not self._file_path.exists():
             self._workbook = Workbook()
-            self._workbook.save(str(self._file_path))
             self._active_sheet = ExcelWorksheet(self._workbook.active)
             return
         
-        # Блокируем файл через lock-файл
+        # Блокируем файл
         self._lock = ExcelFileLock(str(self._file_path))
         if not self._lock.acquire():
             raise FileExistsError(
                 f"Файл {self._file_path} заблокирован другим процессом"
             )
         
-        # Загружаем книгу
-        try:
-            self._workbook = load_workbook(str(self._file_path))
-            self._active_sheet = ExcelWorksheet(self._workbook.active)
-        except Exception as e:
-            # Освобождаем блокировку при ошибке загрузки
-            if self._lock:
-                self._lock.release()
-                self._lock = None
-            raise ValueError(f"Ошибка загрузки файла: {str(e)}")
+        self._workbook = load_workbook(str(self._file_path))
+        self._active_sheet = ExcelWorksheet(self._workbook.active)
     
     def save(self, file_path: Optional[str] = None) -> None:
         """
@@ -578,17 +516,15 @@ class ExcelWorkbook:
         return self._workbook.sheetnames
     
     @property
-    def active_sheet(self) -> ExcelWorksheet:
-        """Вернуть активный лист."""
-        if not self._active_sheet:
-            raise ValueError("Нет активного листа. Откройте файл или создайте новый.")
-        return self._active_sheet
-    
-    @property
     def file_path(self) -> Optional[str]:
         """Вернуть путь к файлу."""
         return str(self._file_path) if self._file_path else None
     
+    @property
+    def active_sheet(self) -> Optional[ExcelWorksheet]:
+        """Вернуть активный лист."""
+        return self._active_sheet
+
     def __enter__(self):
         return self
     
