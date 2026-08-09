@@ -27,8 +27,8 @@ class RowValidationError(Exception):
 class ExcelFileLock:
     """
     Класс для блокировки Excel файла на уровне ОС.
-    Удерживает файловый дескриптор открытым, предотвращая запись/изменение
-    файла другими процессами (особенно эффективно в Windows).
+    Создает .lock файл с информацией о процессе, который удерживает файл.
+    Также пытается захватить эксклюзивную блокировку черезfcntl/msvcrt.
     """
     
     def __init__(self, file_path: str):
@@ -40,15 +40,15 @@ class ExcelFileLock:
             'timestamp': datetime.now().isoformat()
         }
         self._locked = False
-        self._file_handle = None  # Дескриптор файла для удержания блокировки
+        self._lock_handle = None  # Дескриптор lock-файла для удержания блокировки
     
     def acquire(self) -> bool:
         """
         Попытка захватить блокировку файла.
-        Открывает файл в режиме, который блокирует доступ другим процессам на запись.
+        Создает .lock файл и удерживает его открытым.
         Возвращает True если блокировка успешна, False если файл уже заблокирован.
         """
-        # Сначала проверяем наличие lock-файла
+        # Проверяем наличие lock-файла
         if self.lock_file_path.exists():
             # Проверяем, не stale ли lock файл
             try:
@@ -69,60 +69,61 @@ class ExcelFileLock:
                 pass
         
         try:
-            # Ключевой момент: открываем сам файл в режиме 'r+b' и держим его открытым
-            # В Windows это предотвращает открытие файла другими процессами на запись
-            # В Unix это позволяет использоватьfcntl для блокировки
-            self._file_handle = open(self.file_path, 'r+b')
+            # Создаем/открываем lock-файл и удерживаем его открытым
+            # Это предотвращает удаление файла пока мы его держим
+            self._lock_handle = open(self.lock_file_path, 'w', encoding='utf-8')
+            self._lock_handle.write(f"PID: {self.lock_info['pid']}\n")
+            self._lock_handle.write(f"User: {self.lock_info['user']}\n")
+            self._lock_handle.write(f"Timestamp: {self.lock_info['timestamp']}\n")
+            self._lock_handle.flush()
             
-            # На Windows дополнительная блокировка через msvcrt (опционально)
+            # Пытаемся захватить блокировку на lock-файле
             if os.name == 'nt':
                 try:
                     import msvcrt
-                    # Блокируем весь файл для записи другими процессами
-                    # LK_NBLCK - неблокирующая попытка, LK_LOCK - блокирующая
-                    file_size = os.fstat(self._file_handle.fileno()).st_size
-                    if file_size > 0:
-                        msvcrt.locking(self._file_handle.fileno(), msvcrt.LK_LOCK, file_size)
+                    # Блокируем lock-файл
+                    msvcrt.locking(self._lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
                 except (ImportError, OSError):
-                    # Если не удалось заблокировать через msvcrt, 
-                    # полагаемся на то, что open уже заблокировал файл
                     pass
-            
-            # Создаем lock-файл с информацией
-            with open(self.lock_file_path, 'w', encoding='utf-8') as f:
-                f.write(f"PID: {self.lock_info['pid']}\n")
-                f.write(f"User: {self.lock_info['user']}\n")
-                f.write(f"Timestamp: {self.lock_info['timestamp']}\n")
+            else:
+                try:
+                    import fcntl
+                    fcntl.flock(self._lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (ImportError, BlockingIOError):
+                    pass
             
             self._locked = True
             return True
             
         except PermissionError:
-            # Файл уже открыт другим процессом
+            # Файл уже заблокирован другим процессом
             return False
         except Exception:
-            if self._file_handle:
-                self._file_handle.close()
-                self._file_handle = None
+            if self._lock_handle:
+                self._lock_handle.close()
+                self._lock_handle = None
             return False
     
     def release(self):
         """Освободить блокировку файла."""
-        # Снимаем блокировку с файла
-        if self._file_handle:
+        if self._lock_handle:
             try:
                 if os.name == 'nt':
                     try:
                         import msvcrt
-                        file_size = os.fstat(self._file_handle.fileno()).st_size
-                        if file_size > 0:
-                            msvcrt.locking(self._file_handle.fileno(), msvcrt.LK_UNLCK, file_size)
+                        msvcrt.locking(self._lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
                     except:
                         pass
-                self._file_handle.close()
+                else:
+                    try:
+                        import fcntl
+                        fcntl.flock(self._lock_handle.fileno(), fcntl.LOCK_UN)
+                    except:
+                        pass
+                self._lock_handle.close()
             except Exception:
                 pass
-            self._file_handle = None
+            self._lock_handle = None
         
         # Удаляем lock-файл
         if self._locked and self.lock_file_path.exists():
@@ -439,23 +440,37 @@ class ExcelWorkbook:
         Raises:
             FileNotFoundError: Файл не найден и create_new=False
             FileExistsError: Файл заблокирован другим процессом
+            ValueError: Некорректный файл Excel
         """
         self._file_path = Path(file_path).resolve()
         
-        if create_new or not self._file_path.exists():
+        # Если файл не существует и не создаем новый - ошибка
+        if not self._file_path.exists():
+            if not create_new:
+                raise FileNotFoundError(f"Файл {self._file_path} не найден")
+            # Создаем новую книгу и сохраняем
             self._workbook = Workbook()
+            self._workbook.save(str(self._file_path))
             self._active_sheet = ExcelWorksheet(self._workbook.active)
             return
         
-        # Блокируем файл
+        # Блокируем файл через lock-файл
         self._lock = ExcelFileLock(str(self._file_path))
         if not self._lock.acquire():
             raise FileExistsError(
                 f"Файл {self._file_path} заблокирован другим процессом"
             )
         
-        self._workbook = load_workbook(str(self._file_path))
-        self._active_sheet = ExcelWorksheet(self._workbook.active)
+        # Загружаем книгу
+        try:
+            self._workbook = load_workbook(str(self._file_path))
+            self._active_sheet = ExcelWorksheet(self._workbook.active)
+        except Exception as e:
+            # Освобождаем блокировку при ошибке загрузки
+            if self._lock:
+                self._lock.release()
+                self._lock = None
+            raise ValueError(f"Ошибка загрузки файла: {str(e)}")
     
     def save(self, file_path: Optional[str] = None) -> None:
         """
@@ -561,6 +576,13 @@ class ExcelWorkbook:
         if not self._workbook:
             return []
         return self._workbook.sheetnames
+    
+    @property
+    def active_sheet(self) -> ExcelWorksheet:
+        """Вернуть активный лист."""
+        if not self._active_sheet:
+            raise ValueError("Нет активного листа. Откройте файл или создайте новый.")
+        return self._active_sheet
     
     @property
     def file_path(self) -> Optional[str]:
