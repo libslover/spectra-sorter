@@ -636,7 +636,10 @@ class SpectrumExcelApp:
             except Exception as e:
                 messagebox.showerror("Ошибка", f"Не удалось добавить линию:\n{str(e)}", parent=dialog)
         
-        ttk.Button(dialog, text="Добавить", command=on_add).pack(pady=10)
+        add_btn = ttk.Button(dialog, text="Добавить", command=on_add)
+        add_btn.pack(pady=10)
+        dialog.bind('<Return>', lambda e: on_add())
+        add_btn.focus()
     
     def on_insert_data(self):
         """Обработчик кнопки 'Внести данные'."""
@@ -656,11 +659,6 @@ class SpectrumExcelApp:
         dialog.grab_set()
         
         ttk.Label(dialog, text="Введите данные в формате:").pack(pady=5)
-        ttk.Label(dialog, text="число<TAB>число", foreground="gray").pack()
-        ttk.Label(dialog, text="число<TAB>число", foreground="gray").pack()
-        ttk.Label(dialog, text="", text="Пример:").pack()
-        ttk.Label(dialog, text="499,68625<TAB>0,01685", foreground="blue").pack()
-        ttk.Label(dialog, text="2,32556<TAB>0,03365", foreground="blue").pack()
         
         text_widget = tk.Text(dialog, width=40, height=6)
         text_widget.pack(pady=10)
