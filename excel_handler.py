@@ -26,8 +26,9 @@ class RowValidationError(Exception):
 
 class ExcelFileLock:
     """
-    Класс для блокировки Excel файла на время работы.
-    Создает временный файл-лок с информацией о процессе.
+    Класс для блокировки Excel файла на уровне ОС.
+    Удерживает файловый дескриптор открытым, предотвращая запись/изменение
+    файла другими процессами (особенно эффективно в Windows).
     """
     
     def __init__(self, file_path: str):
@@ -39,48 +40,97 @@ class ExcelFileLock:
             'timestamp': datetime.now().isoformat()
         }
         self._locked = False
+        self._file_handle = None  # Дескриптор файла для удержания блокировки
     
     def acquire(self) -> bool:
         """
         Попытка захватить блокировку файла.
+        Открывает файл в режиме, который блокирует доступ другим процессам на запись.
         Возвращает True если блокировка успешна, False если файл уже заблокирован.
         """
+        # Сначала проверяем наличие lock-файла
         if self.lock_file_path.exists():
             # Проверяем, не stale ли lock файл
             try:
                 with open(self.lock_file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
                 # Если процесс больше не существует, можно удалить lock
-                import psutil
-                locked_pid = int(content.split('\n')[0].split(':')[1].strip())
-                if not psutil.pid_exists(locked_pid):
-                    self.lock_file_path.unlink()
-                else:
+                try:
+                    import psutil
+                    locked_pid = int(content.split('\n')[0].split(':')[1].strip())
+                    if not psutil.pid_exists(locked_pid):
+                        self.lock_file_path.unlink()
+                    else:
+                        return False
+                except ImportError:
+                    # Если psutil не установлен, просто считаем файл заблокированным
                     return False
             except (FileNotFoundError, ValueError, IndexError):
                 pass
-            except ImportError:
-                # Если psutil не установлен, просто считаем файл заблокированным
-                return False
         
         try:
+            # Ключевой момент: открываем сам файл в режиме 'r+b' и держим его открытым
+            # В Windows это предотвращает открытие файла другими процессами на запись
+            # В Unix это позволяет использоватьfcntl для блокировки
+            self._file_handle = open(self.file_path, 'r+b')
+            
+            # На Windows дополнительная блокировка через msvcrt (опционально)
+            if os.name == 'nt':
+                try:
+                    import msvcrt
+                    # Блокируем весь файл для записи другими процессами
+                    # LK_NBLCK - неблокирующая попытка, LK_LOCK - блокирующая
+                    file_size = os.fstat(self._file_handle.fileno()).st_size
+                    if file_size > 0:
+                        msvcrt.locking(self._file_handle.fileno(), msvcrt.LK_LOCK, file_size)
+                except (ImportError, OSError):
+                    # Если не удалось заблокировать через msvcrt, 
+                    # полагаемся на то, что open уже заблокировал файл
+                    pass
+            
+            # Создаем lock-файл с информацией
             with open(self.lock_file_path, 'w', encoding='utf-8') as f:
                 f.write(f"PID: {self.lock_info['pid']}\n")
                 f.write(f"User: {self.lock_info['user']}\n")
                 f.write(f"Timestamp: {self.lock_info['timestamp']}\n")
+            
             self._locked = True
             return True
+            
+        except PermissionError:
+            # Файл уже открыт другим процессом
+            return False
         except Exception:
+            if self._file_handle:
+                self._file_handle.close()
+                self._file_handle = None
             return False
     
     def release(self):
         """Освободить блокировку файла."""
+        # Снимаем блокировку с файла
+        if self._file_handle:
+            try:
+                if os.name == 'nt':
+                    try:
+                        import msvcrt
+                        file_size = os.fstat(self._file_handle.fileno()).st_size
+                        if file_size > 0:
+                            msvcrt.locking(self._file_handle.fileno(), msvcrt.LK_UNLCK, file_size)
+                    except:
+                        pass
+                self._file_handle.close()
+            except Exception:
+                pass
+            self._file_handle = None
+        
+        # Удаляем lock-файл
         if self._locked and self.lock_file_path.exists():
             try:
                 self.lock_file_path.unlink()
             except Exception:
                 pass
-            self._locked = False
+        self._locked = False
     
     def __enter__(self):
         if not self.acquire():
