@@ -598,7 +598,7 @@ class SpectrumExcelApp:
         # Диалог выбора диапазона
         dialog = tk.Toplevel(self.root)
         dialog.title("Добавить линию")
-        dialog.geometry("350x200")
+        dialog.geometry("350x250")
         dialog.transient(self.root)
         dialog.grab_set()
         
@@ -638,8 +638,10 @@ class SpectrumExcelApp:
         
         add_btn = ttk.Button(dialog, text="Добавить", command=on_add)
         add_btn.pack(pady=10)
-        dialog.bind('<Return>', lambda e: on_add())
         add_btn.focus()
+        
+        # Привязка Enter к кнопке
+        dialog.bind('<Return>', lambda event: on_add())
     
     def on_insert_data(self):
         """Обработчик кнопки 'Внести данные'."""
