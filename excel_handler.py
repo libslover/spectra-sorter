@@ -454,6 +454,17 @@ class ExcelWorkbook:
             self._active_sheet = ExcelWorksheet(self._workbook.active)
             return
         
+        # Проверяем, является ли файл валидным Excel файлом (пустой файл - не Excel)
+        if self._file_path.stat().st_size == 0:
+            # Пустой файл - создаем новую книгу
+            if create_new:
+                self._workbook = Workbook()
+                self._workbook.save(str(self._file_path))
+                self._active_sheet = ExcelWorksheet(self._workbook.active)
+                return
+            else:
+                raise ValueError(f"Файл {self._file_path} пустой и не является Excel файлом")
+        
         # Блокируем файл через lock-файл
         self._lock = ExcelFileLock(str(self._file_path))
         if not self._lock.acquire():
